@@ -23,6 +23,6 @@ streamlit>=1.35.0
 python-dotenv>=1.0.0
 
 
-## no need to change to requirements.txt file
+## no need to change the requirements.txt file
 
 
