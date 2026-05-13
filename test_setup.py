@@ -11,7 +11,7 @@ client = AzureOpenAI(
 )
 
 response = client.chat.completions.create(
-    model="gpt-4o",  # your deployment name
+    model="gpt-4o-mini",  # your deployment name
     messages=[{"role": "user", "content": "Say hello in one sentence."}]
 )
 

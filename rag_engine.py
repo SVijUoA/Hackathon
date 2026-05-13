@@ -32,7 +32,9 @@ def warn_placeholder_config(endpoint, api_key, search_endpoint, search_key):
 # Retrieve Azure Variables
 endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
 api_key = os.getenv("AZURE_OPENAI_API_KEY")
-azure_openai_model = os.getenv("AZURE_OPENAI_MODEL", "gpt-5.4")  # Use gpt-5.4 for Azure OpenAI
+azure_openai_model = os.getenv("AZURE_OPENAI_MODEL", "gpt-4o-mini")  # Use gpt-4o-mini for Azure OpenAI
+if azure_openai_model:
+    azure_openai_model = azure_openai_model.strip().strip('"').strip("'")
 azure_openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01-preview")
 
 search_endpoint = os.getenv("AZURE_SEARCH_ENDPOINT")
