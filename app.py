@@ -1,6 +1,10 @@
 import streamlit as st
 from rag_engine import generate_response
 
+# Initialize session state early
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
 # --- 1. PAGE CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="IMAC Advisor Agent", page_icon="🛡️", layout="centered")
 
@@ -28,7 +32,21 @@ with st.sidebar:
     if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
-    
+        st.divider()
+    st.subheader("Audit")
+    if st.session_state.messages:
+        # Create a simple text log of the chat
+        chat_log = "IMAC AI Advisor - Audit Log\n\n"
+        for msg in st.session_state.messages:
+            role = "Advisor" if msg["role"] == "user" else "AI System"
+            chat_log += f"{role}: {msg['content']}\n\n"
+        
+        st.download_button(
+            label="💾 Download Audit Log",
+            data=chat_log,
+            file_name="clinical_chat_audit.txt",
+            mime="text/plain"
+        )
     st.divider()
     st.subheader("About")
     st.markdown("""
@@ -45,11 +63,7 @@ Always verify information against official IMAC guidelines.
 """)
 st.divider()
 
-# --- 2. SESSION STATE INITIALIZATION ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# --- 3. RENDER PAST CONVERSATION ---
+# --- 2. RENDER PAST CONVERSATION ---
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
@@ -58,7 +72,7 @@ for message in st.session_state.messages:
                 for citation in message["citations"]:
                     st.markdown(f"- {citation}")
 
-# --- 4. USER INPUT & CHAT LOGIC ---
+# --- 3. USER INPUT & CHAT LOGIC ---
 # SECURITY: THREAT 04 - MODEL DoS (Added max_chars=1000 limit)
 if prompt := st.chat_input("Ask a clinical question regarding immunisation...", max_chars=1000):
     
@@ -103,7 +117,7 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
         "citations": citations
     })
 
-# --- 5. HANDLE QUICK ACTIONS (Robust version handling multiple clicks) ---
+# --- 4. HANDLE QUICK ACTIONS (Robust version handling multiple clicks) ---
 if st.session_state.messages:
     messages_needing_responses = []
     # Find all user messages that do not have a corresponding assistant response
