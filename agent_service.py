@@ -94,8 +94,6 @@ def chat_with_advisor(user_input: str, conversation_id: str = None):
 # ==========================================
 if __name__ == "__main__":
     setup_agent()
-
-    convo_id, reply1 = chat_with_advisor("What is the recommended schedule for the MMR vaccine?")
     
     print("\n🤖 Agent Service Test Terminal (Type 'exit' to quit)")
     convo_id = None
