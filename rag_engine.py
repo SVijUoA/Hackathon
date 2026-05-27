@@ -102,7 +102,7 @@ def get_mock_response(user_prompt):
         )
     else:
         return (
-            "Please refer to the official IMAC guidelines for detailed information on this topic. The question you asked would normally be answered using official IMAC guidelines retrieved from our knowledge base.",
+            "Please refer to the official IMAC guidelines for detailed information on this topic.",
             "The question you asked would normally be answered using official IMAC guidelines retrieved from our knowledge base.",
             ["[IMAC Website](https://immune.org.nz)"]
         )
