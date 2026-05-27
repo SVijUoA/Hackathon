@@ -1,9 +1,18 @@
 import streamlit as st
-from rag_engine import generate_response
+from agent_service import setup_agent, chat_with_advisor
+
+# Cache agent creation so it doesn't create a new version on every UI interaction
+@st.cache_resource
+def init_agent():
+    return setup_agent()
+
+init_agent()
 
 # Initialize session state early
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = None
 
 # --- 1. PAGE CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="IMAC Advisor Agent", page_icon="🛡️", layout="centered")
@@ -31,6 +40,7 @@ with st.sidebar:
     st.divider()
     if st.button("🗑️ Clear Chat History"):
         st.session_state.messages = []
+        st.session_state.conversation_id = None
         st.rerun()
         st.divider()
     st.subheader("Audit")
@@ -67,10 +77,6 @@ st.divider()
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        if "citations" in message and message["citations"]:
-            with st.expander("View Source Citations"):
-                for citation in message["citations"]:
-                    st.markdown(f"- {citation}")
 
 # --- 3. USER INPUT & CHAT LOGIC ---
 # SECURITY: THREAT 04 - MODEL DoS (Added max_chars=1000 limit)
@@ -84,26 +90,18 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         
-        with st.spinner("Searching official IMAC guidelines..."):
-            ai_answer, citations = generate_response(prompt)
+        with st.spinner("Agent is searching official IMAC guidelines..."):
+            convo_id, ai_answer = chat_with_advisor(prompt, st.session_state.conversation_id)
+            st.session_state.conversation_id = convo_id
         
         # Render the text answer FIRST
         message_placeholder.markdown(ai_answer)
         
-        # Then handle citations or safety warnings
-        if ai_answer == "I couldn't find a clear answer in approved guidance.":
+        # Then handle safety warnings
+        if "I cannot find the answer in the official guidance" in ai_answer:
             st.error("🛑 Clinical Safety Protocol Engaged")
             st.warning("Low Confidence: Information not found in the indexed guidance. Please refer to senior clinical staff.")
-        
-        # SECURITY ALERT DISPLAY (Handles prompt injections / blocked queries)
-        elif "Security Alert" in ai_answer:
-            st.error("🛑 Security Protocol Engaged: Query Rejected.")
-            
-        elif citations:
-            with st.expander("View Source Citations"):
-                for citation in citations:
-                    st.markdown(f"- {citation}")
-            
+        else:
             # Feedback Loop
             st.write("Was this response helpful?")
             feedback = st.feedback("thumbs")
@@ -113,8 +111,7 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
     # Save Assistant Response to Session State
     st.session_state.messages.append({
         "role": "assistant", 
-        "content": ai_answer,
-        "citations": citations
+        "content": ai_answer
     })
 
 # --- 4. HANDLE QUICK ACTIONS (Robust version handling multiple clicks) ---
@@ -134,21 +131,16 @@ if st.session_state.messages:
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             
-            with st.spinner("Searching official IMAC guidelines..."):
-                ai_answer, citations = generate_response(user_message["content"])
+            with st.spinner("Agent is searching official IMAC guidelines..."):
+                convo_id, ai_answer = chat_with_advisor(user_message["content"], st.session_state.conversation_id)
+                st.session_state.conversation_id = convo_id
             
             message_placeholder.markdown(ai_answer)
             
-            if ai_answer == "I couldn't find a clear answer in approved guidance.":
+            if "I cannot find the answer in the official guidance" in ai_answer:
                 st.error("🛑 Clinical Safety Protocol Engaged")
                 st.warning("Low Confidence: Information not found in the indexed guidance. Please refer to senior clinical staff.")
-            elif "Security Alert" in ai_answer:
-                st.error("🛑 Security Protocol Engaged: Query Rejected.")
-            elif citations:
-                with st.expander("View Source Citations"):
-                    for citation in citations:
-                        st.markdown(f"- {citation}")
-                
+            else:
                 st.write("Was this response helpful?")
                 feedback = st.feedback("thumbs")
                 if feedback is not None:
@@ -156,6 +148,5 @@ if st.session_state.messages:
         
         st.session_state.messages.append({
             "role": "assistant", 
-            "content": ai_answer,
-            "citations": citations
+            "content": ai_answer
         })
