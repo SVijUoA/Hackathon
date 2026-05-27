@@ -1,5 +1,5 @@
 import streamlit as st
-from rag_engine import generate_response
+from foundry_rag_engine import generate_response
 
 # Initialize session state early
 if "messages" not in st.session_state:
