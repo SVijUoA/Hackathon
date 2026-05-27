@@ -96,3 +96,13 @@ if __name__ == "__main__":
     setup_agent()
 
     convo_id, reply1 = chat_with_advisor("What is the recommended schedule for the MMR vaccine?")
+    
+    print("\n🤖 Agent Service Test Terminal (Type 'exit' to quit)")
+    convo_id = None
+    
+    while True:
+        user_msg = input("\nYou: ")
+        if user_msg.lower() in ['exit', 'quit']:
+            break
+            
+        convo_id, reply = chat_with_advisor(user_msg, convo_id)
