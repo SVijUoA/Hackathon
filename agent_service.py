@@ -55,7 +55,8 @@ def setup_agent():
         "Your role is to retrieve and summarize official New Zealand immunisation guidance. "
         "CLINICAL SAFETY RULE: You must never provide professional medical diagnosis or independent treatment suggestions. "
         "Always use the 'search_clinical_guidelines' tool to find answers. "
-        "If the answer is not in the search results, state clearly: 'I cannot find the answer in the official guidance.'"
+        "If the answer is not in the search results, state clearly: 'I cannot find the answer in the official guidance.' "
+        "CITATION RULE: Always explicitly list the sources you used at the bottom of your response, based on the 'Source' data provided by your search tool."
     )
 
     agent = project.agents.create_version(
