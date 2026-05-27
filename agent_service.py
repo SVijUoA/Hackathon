@@ -10,7 +10,9 @@ from azure.ai.projects.models import PromptAgentDefinition, FunctionTool
 load_dotenv()
 PROJECT_ENDPOINT = os.getenv("PROJECT_ENDPOINT")
 SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT")
-SEARCH_KEY = os.getenv("AZURE_SEARCH_KEY")
+# Fallback to AZURE_SEARCH_ADMIN_KEY to align with existing .env setups
+SEARCH_KEY = os.getenv("AZURE_SEARCH_ADMIN_KEY") or os.getenv("AZURE_SEARCH_KEY")
+SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX_NAME", "imac-guidelines")
 AGENT_NAME = "IMAC_Immunisation_Advisor"
 
 # 2. Connect to Microsoft Foundry
@@ -29,14 +31,13 @@ def search_clinical_guidelines(query: str) -> str:
     
     try:
         credential = AzureKeyCredential(SEARCH_KEY)
-        # Make sure to replace "immunisation-index" with the actual name of your search index in Azure
-        search_client = SearchClient(endpoint=SEARCH_ENDPOINT, index_name="immunisation-index", credential=credential)
+        search_client = SearchClient(endpoint=SEARCH_ENDPOINT, index_name=SEARCH_INDEX, credential=credential)
         
         # Perform a simple search (you can upgrade this to vector search later)
         results = search_client.search(search_text=query, top=3)
         
         # Combine the top results into a single text block for the AI to read
-        retrieved_text = "\n\n".join([f"Source: {doc['title']}\nContent: {doc['content']}" for doc in results])
+        retrieved_text = "\n\n".join([f"Source: {doc.get('source_url', doc.get('title', 'Unknown Source'))}\nContent: {doc.get('content', '')}" for doc in results])
         return retrieved_text
         
     except Exception as e:
