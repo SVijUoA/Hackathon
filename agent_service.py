@@ -44,7 +44,7 @@ def search_clinical_guidelines(query: str) -> str:
         return f"Error connecting to the clinical database: {str(e)}"
 
 # Register the Python function as an AI Tool
-handbook_search_tool = FunctionTool(functions=[search_clinical_guidelines])
+handbook_search_tool = FunctionTool(user_functions={search_clinical_guidelines})
 
 def setup_agent():
     """Run this function to define the agent's strict clinical rules and equip its tools."""
