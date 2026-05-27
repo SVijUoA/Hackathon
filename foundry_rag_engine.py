@@ -60,9 +60,18 @@ warn_placeholder_config(foundry_endpoint, foundry_api_key, foundry_chat_model, f
 # Security configuration
 MAX_USER_PROMPT_LENGTH = 1000
 MAX_SEARCH_RESULTS = 3
-MAX_VECTOR_RESULTS = 5
+MAX_VECTOR_RESULTS = 3
+MAX_CONTEXT_CHUNKS = 3
+MAX_CONTEXT_CHUNK_CHARS = 700
+MAX_CONTEXT_TOTAL_CHARS = 2500
 MAX_FOUNDARY_OUTPUT_TOKENS = 1024
 MAX_FOUNDARY_RETRY_OUTPUT_TOKENS = 2048
+
+
+def _debug_log(message: str):
+    if os.getenv("RAG_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
+        print(f"DEBUG: {message}")
+
 
 # Data sources for ingestion
 SOURCE_URLS = [
@@ -149,6 +158,8 @@ class FoundryClient:
                 "model": model,
                 "input": serialized_input,
                 "max_output_tokens": max_tokens,
+                "reasoning": {"effort": "low"},
+                "text": {"verbosity": "low"},
             }
             return self._request("responses", payload)
 
@@ -349,6 +360,54 @@ def build_documents_from_url(url: str) -> List[Dict[str, str]]:
     return documents
 
 
+def extract_blob_text(blob_name: str, blob_bytes: bytes) -> str:
+    lower_name = blob_name.lower()
+
+    if lower_name.endswith(".pdf"):
+        reader = PdfReader(BytesIO(blob_bytes))
+        pages: List[str] = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                pages.append(text)
+        return "\n\n".join(pages)
+
+    if lower_name.endswith((".html", ".htm")):
+        html = blob_bytes.decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["script", "style", "nav", "footer"]):
+            tag.decompose()
+        return soup.get_text(separator="\n", strip=True)
+
+    if lower_name.endswith((".txt", ".md", ".json", ".csv")):
+        return blob_bytes.decode("utf-8", errors="ignore")
+
+    return blob_bytes.decode("utf-8", errors="ignore")
+
+
+def build_documents_from_blob(blob_name: str, blob_bytes: bytes, blob_url: str) -> List[Dict[str, str]]:
+    text = extract_blob_text(blob_name, blob_bytes)
+    if not text.strip():
+        return []
+
+    documents: List[Dict[str, str]] = []
+    for chunk in chunk_text(text):
+        chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        documents.append(
+            {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{blob_url}#{chunk_hash}")),
+                "title": blob_name,
+                "content": chunk,
+                "url": blob_url,
+                "source": blob_url,
+                "section": blob_name,
+            }
+        )
+
+    print(f"Built {len(documents)} chunk documents from blob {blob_name}")
+    return documents
+
+
 def embed_texts(texts: List[str], batch_size: int = 16) -> List[List[float]]:
     if foundry_client is None:
         raise RuntimeError("Foundry client is not configured for embeddings.")
@@ -416,6 +475,78 @@ def ingest_sources(collection_name: str = VECTOR_COLLECTION_NAME, persist_direct
     )
 
     print(f"Indexed {len(documents)} chunk embeddings into collection '{collection_name}'.")
+    return len(documents)
+
+
+def ingest_blob_container(
+    container_name: str = None,
+    prefix: str = None,
+    collection_name: str = VECTOR_COLLECTION_NAME,
+    persist_directory: str = VECTOR_STORE_DIR,
+    connection_string: str = None,
+) -> int:
+    if foundry_client is None:
+        raise RuntimeError("Foundry client is not configured. Cannot ingest vector data.")
+
+    try:
+        from azure.storage.blob import BlobServiceClient
+    except ImportError as exc:
+        raise RuntimeError("The azure-storage-blob package is required for blob ingestion. Install it with 'pip install azure-storage-blob'.") from exc
+
+    resolved_connection_string = connection_string or os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    resolved_container_name = container_name or os.getenv("AZURE_STORAGE_CONTAINER_NAME") or os.getenv("AZURE_BLOB_CONTAINER_NAME")
+
+    if not resolved_connection_string:
+        raise RuntimeError("Azure Blob ingestion requires AZURE_STORAGE_CONNECTION_STRING or a connection_string argument.")
+    if not resolved_container_name:
+        raise RuntimeError("Azure Blob ingestion requires AZURE_STORAGE_CONTAINER_NAME, AZURE_BLOB_CONTAINER_NAME, or a container_name argument.")
+
+    client = create_vector_store(persist_directory)
+    existing = [get_collection_name(collection) for collection in client.list_collections()]
+    if collection_name in existing:
+        client.delete_collection(collection_name)
+
+    collection = client.get_or_create_collection(name=collection_name)
+
+    service_client = BlobServiceClient.from_connection_string(resolved_connection_string)
+    container_client = service_client.get_container_client(resolved_container_name)
+
+    documents: List[Dict[str, str]] = []
+    blob_iter = container_client.list_blobs(name_starts_with=prefix) if prefix else container_client.list_blobs()
+    for blob in blob_iter:
+        try:
+            blob_client = container_client.get_blob_client(blob.name)
+            blob_bytes = blob_client.download_blob().readall()
+            documents.extend(build_documents_from_blob(blob.name, blob_bytes, blob_client.url))
+            time.sleep(0.2)
+        except Exception as exc:
+            print(f"Warning: failed to ingest blob {blob.name}: {exc}")
+
+    if not documents:
+        print("No documents were created from blob ingestion.")
+        return 0
+
+    contents = [doc["content"] for doc in documents]
+    embeddings = embed_texts(contents)
+    ids = [doc["id"] for doc in documents]
+    metadatas = [
+        {
+            "title": doc["title"],
+            "url": doc["url"],
+            "source": doc["source"],
+            "section": doc["section"],
+        }
+        for doc in documents
+    ]
+
+    collection.add(
+        ids=ids,
+        documents=contents,
+        metadatas=metadatas,
+        embeddings=embeddings,
+    )
+
+    print(f"Indexed {len(documents)} chunk embeddings from blob container '{resolved_container_name}' into collection '{collection_name}'.")
     return len(documents)
 
 
@@ -526,6 +657,27 @@ def get_mock_response(user_prompt):
         )
 
 
+def trim_context_chunks(retrieved_chunks: List[str], max_chunks: int = MAX_CONTEXT_CHUNKS, max_chunk_chars: int = MAX_CONTEXT_CHUNK_CHARS, max_total_chars: int = MAX_CONTEXT_TOTAL_CHARS) -> List[str]:
+    trimmed_chunks: List[str] = []
+    total_chars = 0
+
+    for chunk in retrieved_chunks[:max_chunks]:
+        normalized = re.sub(r"\s+", " ", chunk).strip()
+        if len(normalized) > max_chunk_chars:
+            normalized = normalized[:max_chunk_chars].rsplit(" ", 1)[0].strip()
+            if not normalized:
+                normalized = normalized[:max_chunk_chars]
+            normalized = f"{normalized.strip()}..."
+
+        if total_chars + len(normalized) > max_total_chars and trimmed_chunks:
+            break
+
+        trimmed_chunks.append(normalized)
+        total_chars += len(normalized)
+
+    return trimmed_chunks
+
+
 def generate_response(user_prompt):
     """
     Secure RAG backend function using Foundry for inference.
@@ -561,10 +713,11 @@ def generate_response(user_prompt):
             []
         )
 
+    retrieved_chunks = trim_context_chunks(retrieved_chunks)
     context = "\n\n".join(retrieved_chunks)
 
     prompt_text = (
-        "Answer using only the context below. "
+        "Answer using only the context below. Keep the answer concise and directly relevant. "
         "If the answer cannot be found in the context, reply exactly: I couldn't find a clear answer in approved guidance.\n\n"
         f"Context:\n{context}\n\n"
         f"Question:\n{user_prompt}"
@@ -644,14 +797,14 @@ def generate_response(user_prompt):
         if candidates:
             return candidates[0]
 
-        print("DEBUG: Unable to extract text from Foundry response:", json.dumps(api_response, indent=2)[:3000])
+        _debug_log(f"Unable to extract text from Foundry response: {json.dumps(api_response, indent=2)[:3000]}")
         raise KeyError("Unable to extract text from Foundry response")
 
-    try:
+    def _call_foundry(prompt_to_send: str, max_tokens: int):
         response = foundry_client.chat_completions_create(
             model=foundry_chat_model,
-            messages=[{"role": "user", "content": prompt_text}],
-            max_tokens=MAX_FOUNDARY_OUTPUT_TOKENS,
+            messages=[{"role": "user", "content": prompt_to_send}],
+            max_tokens=max_tokens,
             temperature=0.0,
         )
 
@@ -660,15 +813,31 @@ def generate_response(user_prompt):
             and response.get("status") == "incomplete"
             and response.get("incomplete_details", {}).get("reason") == "max_output_tokens"
         ):
-            print("DEBUG: Foundry response was incomplete due to max_output_tokens; retrying with larger output budget.")
+            _debug_log("Foundry response was incomplete due to max_output_tokens; retrying with larger output budget.")
             response = foundry_client.chat_completions_create(
                 model=foundry_chat_model,
-                messages=[{"role": "user", "content": prompt_text}],
+                messages=[{"role": "user", "content": prompt_to_send}],
                 max_tokens=MAX_FOUNDARY_RETRY_OUTPUT_TOKENS,
                 temperature=0.0,
             )
 
+        return response
+
+    try:
+        response = _call_foundry(prompt_text, MAX_FOUNDARY_OUTPUT_TOKENS)
         ai_answer = _extract_response_text(response)
+
+        if "couldn't find a clear answer" in ai_answer.lower() and citations:
+            _debug_log("Received refusal from strict prompt; retrying with summarization prompt.")
+            summary_prompt = (
+                "Use the context to answer the question. If relevant guidance is present, summarize it directly. "
+                "Do not reply with a refusal.\n\n"
+                f"Context:\n{context}\n\n"
+                f"Question:\n{user_prompt}"
+            )
+            response = _call_foundry(summary_prompt, MAX_FOUNDARY_OUTPUT_TOKENS)
+            ai_answer = _extract_response_text(response)
+
         if "couldn't find a clear answer" in ai_answer.lower():
             return "I couldn't find a clear answer in approved guidance.", citations
         return ai_answer, citations
