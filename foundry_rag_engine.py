@@ -48,9 +48,9 @@ def warn_placeholder_config(foundry_endpoint, foundry_key, foundry_chat_model, f
 # Retrieve Foundry Variables
 foundry_endpoint = os.getenv("FOUNDRY_ENDPOINT")
 foundry_api_key = os.getenv("FOUNDRY_API_KEY")
-foundry_chat_model = os.getenv("FOUNDRY_CHAT_MODEL", "gpt-4o-mini")
+foundry_chat_model = os.getenv("FOUNDRY_CHAT_MODEL", "gpt-5-mini")
 foundry_embedding_model = os.getenv("FOUNDRY_EMBEDDING_MODEL", "text-embedding-3-small")
-foundry_api_version = os.getenv("FOUNDRY_API_VERSION", "2024-06-01-preview")
+foundry_api_version = os.getenv("FOUNDRY_API_VERSION", "2025-08-07")
 
 VECTOR_STORE_DIR = os.getenv("VECTOR_STORE_DIR", "./chroma_store")
 VECTOR_COLLECTION_NAME = os.getenv("VECTOR_COLLECTION_NAME", "imac_guidance")
@@ -81,7 +81,7 @@ HEADERS = {
 class FoundryClient:
     """Wrapper for Foundry inference API calls (chat completions and embeddings)."""
     
-    def __init__(self, endpoint: str, api_key: str, api_version: str = "2024-06-01-preview"):
+    def __init__(self, endpoint: str, api_key: str, api_version: str = foundry_api_version):
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
         self.api_version = api_version
