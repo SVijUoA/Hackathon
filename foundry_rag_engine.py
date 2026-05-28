@@ -61,6 +61,7 @@ warn_placeholder_config(foundry_endpoint, foundry_api_key, foundry_chat_model, f
 MAX_USER_PROMPT_LENGTH = 1000
 MAX_SEARCH_RESULTS = 3
 MAX_VECTOR_RESULTS = 3
+MAX_CONVERSATION_TURNS = 10
 MAX_CONTEXT_CHUNKS = 3
 MAX_CONTEXT_CHUNK_CHARS = 700
 MAX_CONTEXT_TOTAL_CHARS = 2500
@@ -75,6 +76,7 @@ def _debug_log(message: str):
 
 # Data sources for ingestion
 SOURCE_URLS = [
+    "./vaccines.json",
     "https://immune.org.nz",
     "https://www.health.govt.nz/publication/nz-immunisation-handbook-2023",
     "https://immune.org.nz/immunisation/programmes/national-immunisation-schedule",
@@ -334,6 +336,31 @@ def chunk_text(text: str, chunk_size: int = 250, overlap: int = 50) -> List[str]
 
 
 def build_documents_from_url(url: str) -> List[Dict[str, str]]:
+    local_path = os.path.abspath(url) if os.path.exists(url) else None
+    if local_path:
+        lower_path = local_path.lower()
+        if lower_path.endswith(".json"):
+            return build_documents_from_local_json(local_path)
+        if lower_path.endswith((".txt", ".md")):
+            with open(local_path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            title = os.path.basename(local_path)
+            documents: List[Dict[str, str]] = []
+            for chunk in chunk_text(text):
+                chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+                documents.append(
+                    {
+                        "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{local_path}#{chunk_hash}")),
+                        "title": title,
+                        "content": chunk,
+                        "url": local_path,
+                        "source": local_path,
+                        "section": title,
+                    }
+                )
+            print(f"Built {len(documents)} chunk documents from local path {local_path}")
+            return documents
+
     if url.lower().endswith(".pdf"):
         raw_text = fetch_pdf_text(url)
         title = "NZ Immunisation Handbook PDF"
@@ -408,6 +435,49 @@ def build_documents_from_blob(blob_name: str, blob_bytes: bytes, blob_url: str) 
     return documents
 
 
+def flatten_json_value(value, prefix: str = "") -> List[str]:
+    if isinstance(value, dict):
+        flattened = []
+        for key, item in value.items():
+            next_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.extend(flatten_json_value(item, next_prefix))
+        return flattened
+    if isinstance(value, list):
+        flattened = []
+        for index, item in enumerate(value):
+            next_prefix = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            flattened.extend(flatten_json_value(item, next_prefix))
+        return flattened
+    return [f"{prefix}: {value}" if prefix else str(value)]
+
+
+def build_documents_from_local_json(file_path: str) -> List[Dict[str, str]]:
+    with open(file_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    flattened_segments = flatten_json_value(data)
+    text = "\n".join(flattened_segments)
+    if not text.strip():
+        return []
+
+    documents: List[Dict[str, str]] = []
+    for chunk in chunk_text(text):
+        chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+        documents.append(
+            {
+                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{file_path}#{chunk_hash}")),
+                "title": os.path.basename(file_path),
+                "content": chunk,
+                "url": file_path,
+                "source": file_path,
+                "section": os.path.basename(file_path),
+            }
+        )
+
+    print(f"Built {len(documents)} chunk documents from local JSON file {file_path}")
+    return documents
+
+
 def embed_texts(texts: List[str], batch_size: int = 16) -> List[List[float]]:
     if foundry_client is None:
         raise RuntimeError("Foundry client is not configured for embeddings.")
@@ -429,6 +499,30 @@ def embed_texts(texts: List[str], batch_size: int = 16) -> List[List[float]]:
             # Return dummy embeddings on failure
             embeddings.extend([[0.0] * 1536 for _ in batch])
     return embeddings
+
+
+def add_documents_to_collection(
+    collection,
+    ids: List[str],
+    contents: List[str],
+    metadatas: List[Dict[str, str]],
+    embeddings: List[List[float]],
+    batch_size: int = 100,
+) -> int:
+    total_added = 0
+    for start in range(0, len(ids), batch_size):
+        batch_ids = ids[start : start + batch_size]
+        batch_contents = contents[start : start + batch_size]
+        batch_metadatas = metadatas[start : start + batch_size]
+        batch_embeddings = embeddings[start : start + batch_size]
+        collection.add(
+            ids=batch_ids,
+            documents=batch_contents,
+            metadatas=batch_metadatas,
+            embeddings=batch_embeddings,
+        )
+        total_added += len(batch_ids)
+    return total_added
 
 
 def ingest_sources(collection_name: str = VECTOR_COLLECTION_NAME, persist_directory: str = VECTOR_STORE_DIR) -> int:
@@ -467,15 +561,10 @@ def ingest_sources(collection_name: str = VECTOR_COLLECTION_NAME, persist_direct
         for doc in documents
     ]
 
-    collection.add(
-        ids=ids,
-        documents=contents,
-        metadatas=metadatas,
-        embeddings=embeddings,
-    )
+    indexed_count = add_documents_to_collection(collection, ids, contents, metadatas, embeddings)
 
-    print(f"Indexed {len(documents)} chunk embeddings into collection '{collection_name}'.")
-    return len(documents)
+    print(f"Indexed {indexed_count} chunk embeddings into collection '{collection_name}'.")
+    return indexed_count
 
 
 def ingest_blob_container(
@@ -539,15 +628,45 @@ def ingest_blob_container(
         for doc in documents
     ]
 
-    collection.add(
-        ids=ids,
-        documents=contents,
-        metadatas=metadatas,
-        embeddings=embeddings,
-    )
+    indexed_count = add_documents_to_collection(collection, ids, contents, metadatas, embeddings)
 
-    print(f"Indexed {len(documents)} chunk embeddings from blob container '{resolved_container_name}' into collection '{collection_name}'.")
-    return len(documents)
+    print(f"Indexed {indexed_count} chunk embeddings from blob container '{resolved_container_name}' into collection '{collection_name}'.")
+    return indexed_count
+
+
+def ingest_local_json_file(file_path: str, collection_name: str = VECTOR_COLLECTION_NAME, persist_directory: str = VECTOR_STORE_DIR) -> int:
+    if foundry_client is None:
+        raise RuntimeError("Foundry client is not configured. Cannot ingest vector data.")
+
+    client = create_vector_store(persist_directory)
+    existing = [get_collection_name(collection) for collection in client.list_collections()]
+    if collection_name in existing:
+        client.delete_collection(collection_name)
+
+    collection = client.get_or_create_collection(name=collection_name)
+
+    documents = build_documents_from_local_json(file_path)
+    if not documents:
+        print(f"No documents were created from local JSON file {file_path}.")
+        return 0
+
+    contents = [doc["content"] for doc in documents]
+    embeddings = embed_texts(contents)
+    ids = [doc["id"] for doc in documents]
+    metadatas = [
+        {
+            "title": doc["title"],
+            "url": doc["url"],
+            "source": doc["source"],
+            "section": doc["section"],
+        }
+        for doc in documents
+    ]
+
+    indexed_count = add_documents_to_collection(collection, ids, contents, metadatas, embeddings)
+
+    print(f"Indexed {indexed_count} chunk embeddings from local JSON file '{file_path}' into collection '{collection_name}'.")
+    return indexed_count
 
 
 def normalize_query_results(results):
@@ -678,7 +797,7 @@ def trim_context_chunks(retrieved_chunks: List[str], max_chunks: int = MAX_CONTE
     return trimmed_chunks
 
 
-def generate_response(user_prompt):
+def generate_response(user_prompt, conversation_history=None):
     """
     Secure RAG backend function using Foundry for inference.
     Compatible with Streamlit app interface.
@@ -692,6 +811,17 @@ def generate_response(user_prompt):
 
     if not foundry_client:
         return get_mock_response(user_prompt)
+
+    conversation_history = conversation_history or []
+    history_messages = []
+    for message in conversation_history[-MAX_CONVERSATION_TURNS:]:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        stripped_content = content.strip()
+        if stripped_content:
+            history_messages.append({"role": role, "content": stripped_content})
 
     retrieved_chunks: List[str] = []
     citations: List[str] = []
@@ -722,6 +852,20 @@ def generate_response(user_prompt):
         f"Context:\n{context}\n\n"
         f"Question:\n{user_prompt}"
     )
+
+    system_message = {
+        "role": "system",
+        "content": (
+            "You are an IMAC immunisation advisor. Use the earlier turns in the conversation to preserve context, "
+            "resolve follow-up references, and connect the current answer to prior discussion."
+        ),
+    }
+
+    def build_chat_messages(prompt_body: str) -> List[Dict[str, str]]:
+        messages = [system_message]
+        messages.extend(history_messages)
+        messages.append({"role": "user", "content": prompt_body})
+        return messages
 
     def _extract_response_text(api_response: dict) -> str:
         def _extract_from_content(content):
@@ -800,10 +944,10 @@ def generate_response(user_prompt):
         _debug_log(f"Unable to extract text from Foundry response: {json.dumps(api_response, indent=2)[:3000]}")
         raise KeyError("Unable to extract text from Foundry response")
 
-    def _call_foundry(prompt_to_send: str, max_tokens: int):
+    def _call_foundry(messages: List[Dict[str, str]], max_tokens: int):
         response = foundry_client.chat_completions_create(
             model=foundry_chat_model,
-            messages=[{"role": "user", "content": prompt_to_send}],
+            messages=messages,
             max_tokens=max_tokens,
             temperature=0.0,
         )
@@ -816,7 +960,7 @@ def generate_response(user_prompt):
             _debug_log("Foundry response was incomplete due to max_output_tokens; retrying with larger output budget.")
             response = foundry_client.chat_completions_create(
                 model=foundry_chat_model,
-                messages=[{"role": "user", "content": prompt_to_send}],
+                messages=messages,
                 max_tokens=MAX_FOUNDARY_RETRY_OUTPUT_TOKENS,
                 temperature=0.0,
             )
@@ -824,7 +968,7 @@ def generate_response(user_prompt):
         return response
 
     try:
-        response = _call_foundry(prompt_text, MAX_FOUNDARY_OUTPUT_TOKENS)
+        response = _call_foundry(build_chat_messages(prompt_text), MAX_FOUNDARY_OUTPUT_TOKENS)
         ai_answer = _extract_response_text(response)
 
         if "couldn't find a clear answer" in ai_answer.lower() and citations:
@@ -835,7 +979,7 @@ def generate_response(user_prompt):
                 f"Context:\n{context}\n\n"
                 f"Question:\n{user_prompt}"
             )
-            response = _call_foundry(summary_prompt, MAX_FOUNDARY_OUTPUT_TOKENS)
+            response = _call_foundry(build_chat_messages(summary_prompt), MAX_FOUNDARY_OUTPUT_TOKENS)
             ai_answer = _extract_response_text(response)
 
         if "couldn't find a clear answer" in ai_answer.lower():
