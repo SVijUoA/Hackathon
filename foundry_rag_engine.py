@@ -578,7 +578,7 @@ def ingest_blob_container(
         raise RuntimeError("Foundry client is not configured. Cannot ingest vector data.")
 
     try:
-        from azure.storage.blob import BlobServiceClient
+        from azure.storage.blob import BlobServiceClient, BlobClient, ContainerClient
     except ImportError as exc:
         raise RuntimeError("The azure-storage-blob package is required for blob ingestion. Install it with 'pip install azure-storage-blob'.") from exc
 

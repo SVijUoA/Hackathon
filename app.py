@@ -1,5 +1,36 @@
+import traceback
+
 import streamlit as st
+from foundry_agent_bridge import streamlit_agent_response
 from foundry_rag_engine import generate_response
+
+MAX_HISTORY_MESSAGES = 10
+
+
+def build_conversation_history():
+    history = []
+    for message in st.session_state.messages[-MAX_HISTORY_MESSAGES:]:
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        history.append({"role": role, "content": content.strip()})
+    return history
+
+
+def generate_app_response(prompt, conversation_history=None):
+    try:
+        answer = streamlit_agent_response(
+            prompt=prompt,
+            conversation_history=conversation_history,
+        )
+        return answer, [], "deployed agent"
+    except Exception:
+        print("[DEBUG] Deployed agent failed, falling back to local backend")
+        traceback.print_exc()
+        answer, citations = generate_response(prompt, conversation_history=conversation_history)
+        return answer, citations, "existing local backend"
+
 
 # Initialize session state early
 if "messages" not in st.session_state:
@@ -66,6 +97,8 @@ st.divider()
 # --- 2. RENDER PAST CONVERSATION ---
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
+        if message["role"] == "assistant" and message.get("source"):
+            st.caption(f"Debug backend: {message['source']}")
         st.markdown(message["content"])
         if "citations" in message and message["citations"]:
             with st.expander("View Source Citations"):
@@ -84,9 +117,13 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         
-        with st.spinner("Searching official IMAC guidelines..."):
-            ai_answer, citations = generate_response(prompt)
+        with st.spinner("Querying the deployed IMAC agent..."):
+            ai_answer, citations, response_source = generate_app_response(
+                prompt,
+                conversation_history=build_conversation_history(),
+            )
         
+        st.caption(f"Debug backend: {response_source}")
         # Render the text answer FIRST
         message_placeholder.markdown(ai_answer)
         
@@ -112,9 +149,10 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
 
     # Save Assistant Response to Session State
     st.session_state.messages.append({
-        "role": "assistant", 
+        "role": "assistant",
         "content": ai_answer,
-        "citations": citations
+        "citations": citations,
+        "source": response_source,
     })
 
 # --- 4. HANDLE QUICK ACTIONS (Robust version handling multiple clicks) ---
@@ -134,9 +172,13 @@ if st.session_state.messages:
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             
-            with st.spinner("Searching official IMAC guidelines..."):
-                ai_answer, citations = generate_response(user_message["content"])
+            with st.spinner("Querying the deployed IMAC agent..."):
+                ai_answer, citations, response_source = generate_app_response(
+                    user_message["content"],
+                    conversation_history=build_conversation_history(),
+                )
             
+            st.caption(f"Debug backend: {response_source}")
             message_placeholder.markdown(ai_answer)
             
             if ai_answer == "I couldn't find a clear answer in approved guidance.":
@@ -155,7 +197,8 @@ if st.session_state.messages:
                     st.toast("Thank you for your feedback! This helps improve our clinical agent.")
         
         st.session_state.messages.append({
-            "role": "assistant", 
+            "role": "assistant",
             "content": ai_answer,
-            "citations": citations
+            "citations": citations,
+            "source": response_source,
         })
