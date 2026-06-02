@@ -18,17 +18,41 @@ def build_conversation_history():
     return history
 
 
+def _is_refusal_text(text: str) -> bool:
+    if not isinstance(text, str):
+        return False
+    normalized = text.strip().lower()
+    refusal_phrases = [
+        "i'm sorry, but i cannot assist with that request",
+        "i'm sorry but i cannot assist with that request",
+        "i'm sorry, but i cannot help with that request",
+        "i'm sorry but i cannot help with that request",
+        "i'm sorry, but i cannot answer that request",
+        "i'm sorry but i cannot answer that request",
+        "cannot assist with that request",
+        "cannot help with that request",
+        "cannot answer that request",
+    ]
+    return any(phrase in normalized for phrase in refusal_phrases)
+
+
 def generate_app_response(prompt, conversation_history=None):
     try:
         answer = streamlit_agent_response(
             prompt=prompt,
             conversation_history=conversation_history,
         )
+        if _is_refusal_text(answer):
+            print("[DEBUG] Deployed agent returned refusal text; falling back to local backend")
+            raise RuntimeError("Deployed agent refusal")
         return answer, [], "deployed agent"
     except Exception:
-        print("[DEBUG] Deployed agent failed, falling back to local backend")
+        print("[DEBUG] Deployed agent failed or refused; falling back to local backend")
         traceback.print_exc()
         answer, citations = generate_response(prompt, conversation_history=conversation_history)
+        if _is_refusal_text(answer):
+            print("[DEBUG] Local fallback returned refusal text; replacing with safe guidance message")
+            answer = "I couldn't find a clear answer in approved guidance."
         return answer, citations, "existing local backend"
 
 
@@ -97,8 +121,6 @@ st.divider()
 # --- 2. RENDER PAST CONVERSATION ---
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        if message["role"] == "assistant" and message.get("source"):
-            st.caption(f"Debug backend: {message['source']}")
         st.markdown(message["content"])
         if "citations" in message and message["citations"]:
             with st.expander("View Source Citations"):
@@ -123,7 +145,6 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
                 conversation_history=build_conversation_history(),
             )
         
-        st.caption(f"Debug backend: {response_source}")
         # Render the text answer FIRST
         message_placeholder.markdown(ai_answer)
         
@@ -178,7 +199,6 @@ if st.session_state.messages:
                     conversation_history=build_conversation_history(),
                 )
             
-            st.caption(f"Debug backend: {response_source}")
             message_placeholder.markdown(ai_answer)
             
             if ai_answer == "I couldn't find a clear answer in approved guidance.":

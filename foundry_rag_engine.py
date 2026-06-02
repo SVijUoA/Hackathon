@@ -51,6 +51,8 @@ foundry_api_key = os.getenv("FOUNDRY_API_KEY")
 foundry_chat_model = os.getenv("FOUNDRY_CHAT_MODEL", "gpt-5-mini")
 foundry_embedding_model = os.getenv("FOUNDRY_EMBEDDING_MODEL", "text-embedding-3-small")
 foundry_api_version = os.getenv("FOUNDRY_API_VERSION", "2025-08-07")
+azure_openai_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("AZURE_AI_PROJECT_ENDPOINT")
+azure_openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01")
 
 VECTOR_STORE_DIR = os.getenv("VECTOR_STORE_DIR", "./chroma_store")
 VECTOR_COLLECTION_NAME = os.getenv("VECTOR_COLLECTION_NAME", "imac_guidance")
@@ -108,7 +110,7 @@ class FoundryClient:
             self.base_endpoint = self.endpoint[: self.endpoint.rfind("/responses")]
 
         if self.use_responses_api:
-            self.embeddings_url = f"{self.service_root}/openai/v1/embeddings"
+            self.embeddings_url = re.sub(r"/responses/?$", "/embeddings", self.endpoint)
         elif self.endpoint.endswith("/embeddings"):
             self.embeddings_url = self.endpoint
         elif self.endpoint.endswith("/openai/v1"):
@@ -117,6 +119,17 @@ class FoundryClient:
             self.embeddings_url = re.sub(r"/openai/v1/.*$", "/openai/v1/embeddings", self.endpoint)
         else:
             self.embeddings_url = f"{self.endpoint}/openai/v1/embeddings"
+
+        if azure_openai_endpoint and "your-resource" not in azure_openai_endpoint:
+            raw_root = azure_openai_endpoint.strip('"').rstrip("/")
+            if "/api/projects/" in raw_root:
+                raw_root = raw_root.split("/api/projects/", 1)[0]
+            elif "/openai/v1" in raw_root:
+                raw_root = raw_root.split("/openai/v1", 1)[0]
+            self.azure_openai_endpoint = raw_root.rstrip("/")
+        else:
+            self.azure_openai_endpoint = self.service_root
+        self.azure_openai_api_version = azure_openai_api_version or "2024-06-01"
     
     def _build_url(self, path: str) -> str:
         if path == "embeddings":
@@ -151,25 +164,16 @@ class FoundryClient:
                         return alt_response.json()
             raise RuntimeError(f"Foundry API error {response.status_code}: {response.text or response.reason} (url={url})")
         return response.json()
+
+    def _build_azure_openai_embeddings_url(self, model: str) -> str:
+        return f"{self.azure_openai_endpoint}/openai/deployments/{model}/embeddings"
     
     def chat_completions_create(self, model: str, messages: List[Dict[str, str]], max_tokens: int = 500, temperature: float = 0.0):
         """Call Foundry chat completions API."""
-        if self.use_responses_api:
-            serialized_input = "\n".join(msg["content"] for msg in messages)
-            payload = {
-                "model": model,
-                "input": serialized_input,
-                "max_output_tokens": max_tokens,
-                "reasoning": {"effort": "low"},
-                "text": {"verbosity": "low"},
-            }
-            return self._request("responses", payload)
-
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
         }
         return self._request("chat/completions", payload)
     
@@ -201,13 +205,35 @@ class FoundryClient:
         raise KeyError("Unable to extract embeddings from Foundry response")
 
     def embeddings_create(self, model: str, input_texts: List[str]):
-        """Call Foundry embeddings API."""
+        """Call Foundry or Azure OpenAI embeddings API."""
+        input_payload = input_texts[0] if len(input_texts) == 1 else input_texts
+        if self.use_responses_api:
+            url = self._build_azure_openai_embeddings_url(model)
+            params = {"api-version": self.azure_openai_api_version}
+            headers = {
+                "api-key": self.api_key,
+                "Content-Type": "application/json",
+            }
+            _debug_log(f"Embeddings request URL: {url}?api-version={self.azure_openai_api_version}")
+            response = requests.post(
+                url,
+                headers=headers,
+                params=params,
+                json={"input": input_payload},
+                timeout=30,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Foundry API error {response.status_code}: {response.text or response.reason} (url={url})"
+                )
+            response_json = response.json()
+            return {"data": [{"embedding": emb} for emb in self._extract_embeddings(response_json)]}
+
         payload = {
             "model": model,
-            "input": input_texts,
+            "input": input_payload,
         }
-        path = "embeddings" if self.use_responses_api else "embeddings"
-        response = self._request(path, payload)
+        response = self._request("embeddings", payload)
         return {"data": [{"embedding": emb} for emb in self._extract_embeddings(response)]}
 
 
@@ -913,10 +939,16 @@ def generate_response(user_prompt, conversation_history=None):
         if "choices" in api_response:
             choice = api_response["choices"][0]
             if isinstance(choice, dict) and "message" in choice:
-                return choice["message"].get("content", "").strip()
+                text = choice["message"].get("content", "").strip()
+                if text:
+                    _debug_log(f"Extracted from choices[0].message.content: {text[:100]}")
+                    return text
 
         if "output_text" in api_response and isinstance(api_response["output_text"], str):
-            return api_response["output_text"].strip()
+            text = api_response["output_text"].strip()
+            if text:
+                _debug_log(f"Extracted from output_text: {text[:100]}")
+                return text
 
         output = api_response.get("output")
         if isinstance(output, list):
@@ -930,15 +962,19 @@ def generate_response(user_prompt, conversation_history=None):
                     texts.append(item["text"])
             filtered = [t.strip() for t in texts if t and t.strip()]
             if filtered:
-                return "\n".join(filtered).strip()
+                result = "\n".join(filtered).strip()
+                _debug_log(f"Extracted from output array: {result[:100]}")
+                return result
 
         if "text" in api_response and isinstance(api_response["text"], dict):
             nested = api_response["text"].get("text")
             if isinstance(nested, str) and nested.strip():
+                _debug_log(f"Extracted from text.text: {nested[:100]}")
                 return nested.strip()
 
         candidates = _collect_candidate_texts(api_response)
         if candidates:
+            _debug_log(f"Extracted from candidates: {candidates[0][:100]}")
             return candidates[0]
 
         _debug_log(f"Unable to extract text from Foundry response: {json.dumps(api_response, indent=2)[:3000]}")
@@ -949,27 +985,68 @@ def generate_response(user_prompt, conversation_history=None):
             model=foundry_chat_model,
             messages=messages,
             max_tokens=max_tokens,
-            temperature=0.0,
         )
 
-        if (
-            isinstance(response, dict)
-            and response.get("status") == "incomplete"
-            and response.get("incomplete_details", {}).get("reason") == "max_output_tokens"
-        ):
-            _debug_log("Foundry response was incomplete due to max_output_tokens; retrying with larger output budget.")
-            response = foundry_client.chat_completions_create(
-                model=foundry_chat_model,
-                messages=messages,
-                max_tokens=MAX_FOUNDARY_RETRY_OUTPUT_TOKENS,
-                temperature=0.0,
-            )
+        # Detect truncated or empty chat completion responses (some Foundry
+        # variants return an empty message when the model stopped due to
+        # length). If truncated/empty, retry with a larger output budget.
+        try:
+            if isinstance(response, dict):
+                choices = response.get("choices")
+                if isinstance(choices, list) and len(choices) > 0:
+                    first = choices[0]
+                    finish_reason = first.get("finish_reason")
+                    message_obj = first.get("message") if isinstance(first.get("message"), dict) else {}
+                    message_text = (message_obj or {}).get("content", "") or ""
+                    # If finish reason indicates length or returned text is empty,
+                    # retry with larger token budget (but avoid infinite loops).
+                    if (finish_reason == "length" or not message_text.strip()) and max_tokens < MAX_FOUNDARY_RETRY_OUTPUT_TOKENS:
+                        _debug_log("Foundry completion truncated or empty; retrying with larger output budget.")
+                        response = foundry_client.chat_completions_create(
+                            model=foundry_chat_model,
+                            messages=messages,
+                            max_tokens=MAX_FOUNDARY_RETRY_OUTPUT_TOKENS,
+                        )
+        except Exception:
+            # Do not let debug/inspection prevent returning the original response
+            _debug_log("Non-fatal error while inspecting Foundry response for truncation")
 
         return response
 
+    def _get_finish_reason(api_response: dict) -> str | None:
+        if not isinstance(api_response, dict):
+            return None
+        choices = api_response.get("choices")
+        if isinstance(choices, list) and len(choices) > 0:
+            return choices[0].get("finish_reason")
+        return None
+
+    def _looks_truncated(text: str) -> bool:
+        if not isinstance(text, str) or not text.strip():
+            return True
+        stripped = text.rstrip()
+        # If the last character isn't a sentence terminator, consider it truncated
+        if stripped[-1] not in {'.', '!', '?', '"', "'"}:
+            # also consider very short answers as truncated
+            if len(stripped) < 80:
+                return False
+            return True
+        return False
+
+    def _extractive_fallback(chunks: List[str]) -> str:
+        if not chunks:
+            return "I couldn't find a clear answer in approved guidance."
+        excerpt = "\n\n".join(chunks[:2])
+        return (
+            "Based on the retrieved IMAC guidance, the most relevant passages are below:\n\n"
+            f"{excerpt}"
+        )
+
     try:
         response = _call_foundry(build_chat_messages(prompt_text), MAX_FOUNDARY_OUTPUT_TOKENS)
+        _debug_log(f"Foundry response type: {type(response)}, keys: {response.keys() if isinstance(response, dict) else 'N/A'}")
         ai_answer = _extract_response_text(response)
+        _debug_log(f"Extracted answer length: {len(ai_answer)} chars, preview: {ai_answer[:200] if ai_answer else '(empty)'}")
 
         if "couldn't find a clear answer" in ai_answer.lower() and citations:
             _debug_log("Received refusal from strict prompt; retrying with summarization prompt.")
@@ -979,12 +1056,59 @@ def generate_response(user_prompt, conversation_history=None):
                 f"Context:\n{context}\n\n"
                 f"Question:\n{user_prompt}"
             )
-            response = _call_foundry(build_chat_messages(summary_prompt), MAX_FOUNDARY_OUTPUT_TOKENS)
+            response = _call_foundry(build_chat_messages(summary_prompt), MAX_FOUNDARY_RETRY_OUTPUT_TOKENS)
             ai_answer = _extract_response_text(response)
+            _debug_log(f"Retry answer length: {len(ai_answer)} chars, preview: {ai_answer[:200] if ai_answer else '(empty)'}")
+
+        # If the answer appears truncated (finish reason 'length' or ends without
+        # sentence terminator), attempt concise continuation requests to finish
+        # the sentence. This helps with mid-sentence cut-offs.
+        try:
+            finish_reason = _get_finish_reason(response)
+            if finish_reason == "length" or _looks_truncated(ai_answer):
+                _debug_log(f"Detected truncated answer (finish_reason={finish_reason}); attempting continuation")
+                for attempt in range(2):
+                    cont_prompt = "Please continue the previous answer and finish the sentence concisely."
+                    continuation_messages = [system_message]
+                    continuation_messages.extend(history_messages)
+                    continuation_messages.append({"role": "assistant", "content": ai_answer})
+                    continuation_messages.append({"role": "user", "content": cont_prompt})
+                    cont_response = _call_foundry(continuation_messages, 256)
+                    cont_text = ""
+                    try:
+                        cont_text = _extract_response_text(cont_response)
+                    except KeyError:
+                        _debug_log("Continuation response could not be extracted")
+                        cont_text = ""
+                    if cont_text:
+                        _debug_log(f"Continuation #{attempt+1} appended, length={len(cont_text)}")
+                        # Append the continuation (ensure spacing)
+                        if not ai_answer.endswith(" "):
+                            ai_answer = ai_answer + " "
+                        ai_answer = ai_answer + cont_text.strip()
+                        # If continuation seems to finish the sentence, break
+                        if not _looks_truncated(ai_answer):
+                            break
+                _debug_log(f"Post-continuation answer length: {len(ai_answer)}")
+        except Exception:
+            _debug_log("Non-fatal error during continuation attempts")
 
         if "couldn't find a clear answer" in ai_answer.lower():
-            return "I couldn't find a clear answer in approved guidance.", citations
+            _debug_log("Still received refusal; using extractive fallback")
+            return _extractive_fallback(retrieved_chunks), citations
         return ai_answer, citations
 
+    except KeyError as e:
+        # Extraction failed — return the extractive fallback rather than surfacing a KeyError
+        _debug_log(f"Extraction failed, returning extractive fallback: {e}")
+        return _extractive_fallback(retrieved_chunks), citations
     except Exception as e:
+        _debug_log(f"Exception in generate_response: {str(e)}")
+        # Map content filter / policy rejections to a safe, user-facing message
+        try:
+            err_text = str(e)
+            if "content_filter" in err_text or "ResponsibleAIPolicyViolation" in err_text or '"code":"content_filter"' in err_text:
+                return "I cannot answer this query, please modify your prompt and retry", []
+        except Exception:
+            pass
         return f"System Error: {str(e)}", []
