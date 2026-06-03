@@ -36,16 +36,35 @@ def _is_refusal_text(text: str) -> bool:
     return any(phrase in normalized for phrase in refusal_phrases)
 
 
+def render_citations(citations):
+    """
+    Render a structured citations list from the Foundry agent.
+    Each entry is either a dict {"filename": str, "ref_num": int}
+    (new structured format) or a plain string (legacy fallback).
+    """
+    if not citations:
+        return
+    with st.expander("📚 View Source Citations"):
+        for citation in citations:
+            if isinstance(citation, dict):
+                ref_num  = citation.get("ref_num", "")
+                filename = citation.get("filename", "Source")
+                st.markdown(f"**[{ref_num}]** `{filename}`")
+            else:
+                st.markdown(f"- {citation}")
+
+
 def generate_app_response(prompt, conversation_history=None):
     try:
-        answer = streamlit_agent_response(
+        # Unpack both text answer and citations from the deployed agent
+        answer, citations = streamlit_agent_response(
             prompt=prompt,
             conversation_history=conversation_history,
         )
         if _is_refusal_text(answer):
             print("[DEBUG] Deployed agent returned refusal text; falling back to local backend")
             raise RuntimeError("Deployed agent refusal")
-        return answer, [], "deployed agent"
+        return answer, citations, "deployed agent"
     except Exception:
         print("[DEBUG] Deployed agent failed or refused; falling back to local backend")
         traceback.print_exc()
@@ -123,9 +142,7 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if "citations" in message and message["citations"]:
-            with st.expander("View Source Citations"):
-                for citation in message["citations"]:
-                    st.markdown(f"- {citation}")
+            render_citations(message["citations"])
 
 # --- 3. USER INPUT & CHAT LOGIC ---
 # SECURITY: THREAT 04 - MODEL DoS (Added max_chars=1000 limit)
@@ -148,21 +165,19 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
         # Render the text answer FIRST
         message_placeholder.markdown(ai_answer)
         
-        # Then handle citations or safety warnings
+        # Safety / security banners (independent of citations)
         if ai_answer == "I couldn't find a clear answer in approved guidance.":
             st.error("🛑 Clinical Safety Protocol Engaged")
             st.warning("Low Confidence: Information not found in the indexed guidance. Please refer to senior clinical staff.")
-        
-        # SECURITY ALERT DISPLAY (Handles prompt injections / blocked queries)
         elif "Security Alert" in ai_answer:
             st.error("🛑 Security Protocol Engaged: Query Rejected.")
-            
-        elif citations:
-            with st.expander("View Source Citations"):
-                for citation in citations:
-                    st.markdown(f"- {citation}")
-            
-            # Feedback Loop
+
+        # Citations – always shown when present, regardless of safety banners
+        if citations:
+            render_citations(citations)
+
+        # Feedback – shown for every normal (non-safety, non-security) response
+        if ai_answer not in ("I couldn't find a clear answer in approved guidance.",) and "Security Alert" not in ai_answer:
             st.write("Was this response helpful?")
             feedback = st.feedback("thumbs")
             if feedback is not None:
@@ -201,16 +216,19 @@ if st.session_state.messages:
             
             message_placeholder.markdown(ai_answer)
             
+            # Safety / security banners
             if ai_answer == "I couldn't find a clear answer in approved guidance.":
                 st.error("🛑 Clinical Safety Protocol Engaged")
                 st.warning("Low Confidence: Information not found in the indexed guidance. Please refer to senior clinical staff.")
             elif "Security Alert" in ai_answer:
                 st.error("🛑 Security Protocol Engaged: Query Rejected.")
-            elif citations:
-                with st.expander("View Source Citations"):
-                    for citation in citations:
-                        st.markdown(f"- {citation}")
-                
+
+            # Citations – always shown when present
+            if citations:
+                render_citations(citations)
+
+            # Feedback – shown for every normal response
+            if ai_answer not in ("I couldn't find a clear answer in approved guidance.",) and "Security Alert" not in ai_answer:
                 st.write("Was this response helpful?")
                 feedback = st.feedback("thumbs")
                 if feedback is not None:
