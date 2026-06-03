@@ -823,6 +823,79 @@ def trim_context_chunks(retrieved_chunks: List[str], max_chunks: int = MAX_CONTE
     return trimmed_chunks
 
 
+def condense_query(user_prompt: str, conversation_history: List[Dict[str, str]]) -> str:
+    """
+    Rewrite a follow-up question into a fully self-contained search query by
+    incorporating relevant context from the conversation history.
+
+    The condensed query is used for both vector-store retrieval and as the
+    standalone question sent to the LLM, replacing the raw multi-turn history.
+    Falls back to the original prompt if condensation fails or history is empty.
+    """
+    if not conversation_history or not foundry_client:
+        return user_prompt
+
+    # Collect the most recent Q+A pair (previous user question + assistant reply)
+    # that precedes the current prompt.  Including the assistant reply is critical
+    # because entity names (e.g. "Boostrix") often appear there, not in the user turn.
+    # The current prompt is already in session state, so skip it when searching.
+    current_prompt_stripped = user_prompt.strip()
+    prev_user_q = ""
+    prev_assistant_a = ""
+
+    # Walk history in reverse; grab the first assistant turn, then the user
+    # turn before it (skipping the current prompt).
+    found_assistant = False
+    for message in reversed(conversation_history):
+        role = message.get("role", "")
+        content = (message.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "assistant" and not found_assistant:
+            prev_assistant_a = content[:300]
+            found_assistant = True
+        elif role == "user" and content != current_prompt_stripped:
+            prev_user_q = content[:200]
+            break  # we have both; stop
+
+    if not prev_user_q and not prev_assistant_a:
+        return user_prompt
+
+    context_lines = []
+    if prev_user_q:
+        context_lines.append(f"Previous question: {prev_user_q}")
+    if prev_assistant_a:
+        context_lines.append(f"Previous answer (summary): {prev_assistant_a}")
+    context_block = "\n".join(context_lines)
+
+    condensation_prompt = (
+        f"{context_block}\n"
+        f"Follow-up: {user_prompt}\n"
+        "Rewrite the follow-up as a standalone search query resolving any pronouns or "
+        "vague references using the context above. "
+        "Output only the rewritten query, nothing else."
+    )
+
+    try:
+        condensation_messages = [{"role": "user", "content": condensation_prompt}]
+        response = foundry_client.chat_completions_create(
+            model=foundry_chat_model,
+            messages=condensation_messages,
+            max_tokens=500,
+        )
+        condensed = ""
+        if isinstance(response, dict) and "choices" in response:
+            choice = response["choices"][0]
+            condensed = (choice.get("message") or {}).get("content", "").strip()
+        if condensed:
+            _debug_log(f"condense_query: '{user_prompt}' -> '{condensed}'")
+            return condensed
+    except Exception as exc:
+        _debug_log(f"condense_query failed, using original prompt: {exc}")
+
+    return user_prompt
+
+
 def generate_response(user_prompt, conversation_history=None):
     """
     Secure RAG backend function using Foundry for inference.
@@ -839,22 +912,23 @@ def generate_response(user_prompt, conversation_history=None):
         return get_mock_response(user_prompt)
 
     conversation_history = conversation_history or []
-    history_messages = []
-    for message in conversation_history[-MAX_CONVERSATION_TURNS:]:
-        role = message.get("role")
-        content = message.get("content")
-        if role not in {"user", "assistant"} or not isinstance(content, str):
-            continue
-        stripped_content = content.strip()
-        if stripped_content:
-            history_messages.append({"role": role, "content": stripped_content})
+
+    # Condense the follow-up + history into one standalone query.
+    # This single query drives both vector retrieval and the LLM prompt,
+    # replacing the previous approach of forwarding raw multi-turn history.
+    standalone_query = condense_query(user_prompt, conversation_history)
+    _debug_log(f"generate_response: standalone_query='{standalone_query}'")
+
+    # history_messages is kept empty — context is already baked into
+    # standalone_query, so we don't send raw turns to the LLM.
+    history_messages: List[Dict[str, str]] = []
 
     retrieved_chunks: List[str] = []
     citations: List[str] = []
 
     if ensure_vector_index(VECTOR_STORE_DIR, VECTOR_COLLECTION_NAME):
         try:
-            retrieved_chunks, citations = query_vector_store(user_prompt, VECTOR_COLLECTION_NAME, VECTOR_STORE_DIR)
+            retrieved_chunks, citations = query_vector_store(standalone_query, VECTOR_COLLECTION_NAME, VECTOR_STORE_DIR)
             if not retrieved_chunks:
                 return (
                     "System Error: No relevant guidance was retrieved from the vector store. "
@@ -876,7 +950,7 @@ def generate_response(user_prompt, conversation_history=None):
         "Answer using only the context below. Keep the answer concise and directly relevant. "
         "If the answer cannot be found in the context, reply exactly: I couldn't find a clear answer in approved guidance.\n\n"
         f"Context:\n{context}\n\n"
-        f"Question:\n{user_prompt}"
+        f"Question:\n{standalone_query}"
     )
 
     system_message = {
@@ -1054,7 +1128,7 @@ def generate_response(user_prompt, conversation_history=None):
                 "Use the context to answer the question. If relevant guidance is present, summarize it directly. "
                 "Do not reply with a refusal.\n\n"
                 f"Context:\n{context}\n\n"
-                f"Question:\n{user_prompt}"
+                f"Question:\n{standalone_query}"
             )
             response = _call_foundry(build_chat_messages(summary_prompt), MAX_FOUNDARY_RETRY_OUTPUT_TOKENS)
             ai_answer = _extract_response_text(response)

@@ -212,8 +212,31 @@ def extract_agent_text_and_citations(response) -> Tuple[str, List[Dict]]:
             # Strip any leftover 【n:m†…】 markers that had no annotation object
             raw_text = re.sub(r"【\d+:\d+†[^】]*】", "", raw_text)
 
-            if raw_text.strip():
-                answer_text += ("\n" if answer_text else "") + raw_text.strip()
+            stripped = raw_text.strip()
+            if not stripped:
+                continue
+
+            # Discard blocks that are pure agent refusals (no annotations,
+            # short, and match known refusal phrases). This prevents a trailing
+            # content-filter refusal item from poisoning an otherwise good answer.
+            _refusal_phrases = (
+                "i'm sorry, but i cannot assist",
+                "i'm sorry but i cannot assist",
+                "i'm sorry, but i cannot help",
+                "i'm sorry but i cannot help",
+                "cannot assist with that request",
+                "cannot help with that request",
+            )
+            is_refusal = (
+                not annotations
+                and len(stripped) < 120
+                and any(p in stripped.lower() for p in _refusal_phrases)
+            )
+            if is_refusal:
+                print(f"[DEBUG] extract: skipping refusal block: {repr(stripped[:80])}")
+                continue
+
+            answer_text += ("\n" if answer_text else "") + stripped
 
     if not answer_text:
         fallback_text = getattr(response, "output_text", None)
@@ -239,6 +262,113 @@ def extract_agent_text_and_citations(response) -> Tuple[str, List[Dict]]:
     return answer_text.strip(), citations
 
 
+def _chat_completions_for_condensation(prompt_text: str) -> str:
+    """
+    Call the Foundry chat completions endpoint to rephrase a query.
+
+    Deliberately bypasses the deployed IMAC agent (which has a clinical system
+    prompt and content filters that interfere with meta-tasks like rephrasing).
+    Reuses the already-initialised foundry_client from foundry_rag_engine so
+    the correct endpoint and credentials are guaranteed without duplicating
+    URL-building logic. Returns an empty string on any failure.
+    """
+    try:
+        from foundry_rag_engine import foundry_client, foundry_chat_model
+    except ImportError as exc:
+        print(f"[DEBUG] _chat_completions_for_condensation: import failed: {exc}")
+        return ""
+
+    if foundry_client is None:
+        print("[DEBUG] _chat_completions_for_condensation: foundry_client not initialised, skipping")
+        return ""
+
+    try:
+        print(f"[DEBUG] _chat_completions_for_condensation: calling foundry_client.chat_completions_create")
+        response = foundry_client.chat_completions_create(
+            model=foundry_chat_model,
+            messages=[{"role": "user", "content": prompt_text}],
+            max_tokens=500,
+        )
+        choices = response.get("choices") or [] if isinstance(response, dict) else []
+        if choices:
+            finish_reason = choices[0].get("finish_reason", "")
+            text = (choices[0].get("message") or {}).get("content", "").strip()
+            print(f"[DEBUG] _chat_completions_for_condensation: finish_reason={finish_reason} content_len={len(text)}")
+            if text:
+                return text
+        print("[DEBUG] _chat_completions_for_condensation: empty or unparseable response")
+    except Exception as exc:
+        print(f"[DEBUG] _chat_completions_for_condensation call failed: {exc}")
+        import traceback; traceback.print_exc()
+
+    return ""
+
+
+def condense_query(
+    prompt: str,
+    conversation_history: Optional[List[Dict[str, str]]],
+) -> str:
+    """
+    Rewrite a follow-up question into a fully self-contained search query by
+    incorporating relevant context from the conversation history.
+
+    Uses a plain chat-completions call (not the IMAC agent) so the rephrasing
+    task is not blocked by clinical content filters or the agent's system prompt.
+    Falls back to the original prompt if history is empty or the call fails.
+    """
+    if not conversation_history:
+        return prompt
+
+    # Collect the most recent Q+A pair (previous user question + assistant reply)
+    # that precedes the current prompt.  Including the assistant reply is critical
+    # because entity names (e.g. "Boostrix") often appear there, not in the user turn.
+    # The current prompt is already in session state, so skip it when searching.
+    current_prompt_stripped = prompt.strip()
+    prev_user_q = ""
+    prev_assistant_a = ""
+
+    # Walk history in reverse; grab the first assistant turn, then the user
+    # turn before it (skipping the current prompt).
+    found_assistant = False
+    for message in reversed(conversation_history):
+        role = message.get("role", "")
+        content = (message.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "assistant" and not found_assistant:
+            prev_assistant_a = content[:300]
+            found_assistant = True
+        elif role == "user" and content != current_prompt_stripped:
+            prev_user_q = content[:200]
+            break  # we have both; stop
+
+    if not prev_user_q and not prev_assistant_a:
+        return prompt
+
+    context_lines = []
+    if prev_user_q:
+        context_lines.append(f"Previous question: {prev_user_q}")
+    if prev_assistant_a:
+        context_lines.append(f"Previous answer (summary): {prev_assistant_a}")
+    context_block = "\n".join(context_lines)
+
+    condensation_prompt = (
+        f"{context_block}\n"
+        f"Follow-up: {prompt}\n"
+        "Rewrite the follow-up as a standalone search query resolving any pronouns or "
+        "vague references using the context above. "
+        "Output only the rewritten query, nothing else."
+    )
+
+    condensed = _chat_completions_for_condensation(condensation_prompt)
+    if condensed:
+        print(f"[DEBUG] condense_query: '{prompt}' -> '{condensed}'")
+        return condensed
+
+    print("[DEBUG] condense_query: condensation returned empty, using original prompt")
+    return prompt
+
+
 def ask_foundry_agent(
     prompt: str,
     conversation_history: Optional[List[Dict[str, str]]] = None,
@@ -257,7 +387,19 @@ def ask_foundry_agent(
 
     resolved_model = model or os.getenv("FOUNDRY_AGENT_MODEL", "gpt-5-mini")
     resolved_max_tokens = max_tokens or int(os.getenv("FOUNDRY_AGENT_MAX_TOKENS", "2000"))
-    prepared_messages = build_messages(prompt, conversation_history)
+
+    # Condense conversation history + follow-up into one standalone query.
+    # This replaces sending raw multi-turn history to the agent; instead we
+    # send a single, self-contained user message that already resolves all
+    # pronouns and context references from earlier turns.
+    standalone_query = condense_query(
+        prompt=prompt,
+        conversation_history=conversation_history,
+    )
+    print(f"[DEBUG] ask_foundry_agent: standalone_query='{standalone_query}'")
+
+    # Build a single-turn input from the condensed query (no history).
+    prepared_messages = build_messages(standalone_query, conversation_history=None)
 
     # `instructions=` is rejected when an agent is specified – the agent owns
     # its system prompt in Azure AI Foundry and the API forbids overriding it.
@@ -335,4 +477,3 @@ def streamlit_agent_response(
         print("[DEBUG] streamlit_agent_response failed")
         traceback.print_exc()
         raise
-

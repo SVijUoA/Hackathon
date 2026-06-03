@@ -41,7 +41,20 @@ def render_citations(citations):
     Render a structured citations list from the Foundry agent.
     Each entry is either a dict {"filename": str, "ref_num": int}
     (new structured format) or a plain string (legacy fallback).
+
+    Known filenames are resolved to their canonical public URLs so the
+    user sees a clickable link rather than a raw filename.
     """
+    # Map agent-returned filenames to their public URLs.
+    # Add new entries here whenever a new source file is indexed.
+    FILENAME_TO_URL = {
+        "immunisation-handbook-2026-v2.pdf": (
+            "https://static.info.content.health.nz/docs/health-pros/topics/"
+            "immunisations/immunisation-handbook-2026-v2.pdf"
+        ),
+        "vaccines.json": "https://immune.org.nz/vaccines-and-diseases/vaccines",
+    }
+
     if not citations:
         return
     with st.expander("📚 View Source Citations"):
@@ -49,9 +62,23 @@ def render_citations(citations):
             if isinstance(citation, dict):
                 ref_num  = citation.get("ref_num", "")
                 filename = citation.get("filename", "Source")
-                st.markdown(f"**[{ref_num}]** `{filename}`")
+                url = FILENAME_TO_URL.get(filename)
+                if url:
+                    st.markdown(f"**[{ref_num}]** [{url}]({url})")
+                else:
+                    st.markdown(f"**[{ref_num}]** `{filename}`")
             else:
-                st.markdown(f"- {citation}")
+                # Plain string citation (local RAG backend). Check if any known
+                # filename appears in the path and resolve to its public URL.
+                resolved_url = None
+                for known_name, known_url in FILENAME_TO_URL.items():
+                    if known_name in citation:
+                        resolved_url = known_url
+                        break
+                if resolved_url:
+                    st.markdown(f"- [{resolved_url}]({resolved_url})")
+                else:
+                    st.markdown(f"- {citation}")
 
 
 def generate_app_response(prompt, conversation_history=None):
