@@ -32,6 +32,7 @@ def _is_refusal_text(text: str) -> bool:
         "cannot assist with that request",
         "cannot help with that request",
         "cannot answer that request",
+        "i could not find information on this topic in the approved imac guidance documents",
     ]
     return any(phrase in normalized for phrase in refusal_phrases)
 
@@ -169,7 +170,10 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if "citations" in message and message["citations"]:
-            render_citations(message["citations"])
+            msg_content = message.get("content", "")
+            is_safety = msg_content == "I couldn't find a clear answer in approved guidance."
+            if not is_safety and "Security Alert" not in msg_content:
+                render_citations(message["citations"])
 
 # --- 3. USER INPUT & CHAT LOGIC ---
 # SECURITY: THREAT 04 - MODEL DoS (Added max_chars=1000 limit)
@@ -193,14 +197,15 @@ if prompt := st.chat_input("Ask a clinical question regarding immunisation...", 
         message_placeholder.markdown(ai_answer)
         
         # Safety / security banners (independent of citations)
-        if ai_answer == "I couldn't find a clear answer in approved guidance.":
+        is_safety_response = ai_answer == "I couldn't find a clear answer in approved guidance."
+        if is_safety_response:
             st.error("🛑 Clinical Safety Protocol Engaged")
             st.warning("Low Confidence: Information not found in the indexed guidance. Please refer to senior clinical staff.")
         elif "Security Alert" in ai_answer:
             st.error("🛑 Security Protocol Engaged: Query Rejected.")
 
-        # Citations – always shown when present, regardless of safety banners
-        if citations:
+        # Citations – suppressed when a safety/security message is shown
+        if citations and not is_safety_response and "Security Alert" not in ai_answer:
             render_citations(citations)
 
         # Feedback – shown for every normal (non-safety, non-security) response
@@ -244,14 +249,15 @@ if st.session_state.messages:
             message_placeholder.markdown(ai_answer)
             
             # Safety / security banners
-            if ai_answer == "I couldn't find a clear answer in approved guidance.":
+            is_safety_response = ai_answer == "I couldn't find a clear answer in approved guidance."
+            if is_safety_response:
                 st.error("🛑 Clinical Safety Protocol Engaged")
                 st.warning("Low Confidence: Information not found in the indexed guidance. Please refer to senior clinical staff.")
             elif "Security Alert" in ai_answer:
                 st.error("🛑 Security Protocol Engaged: Query Rejected.")
 
-            # Citations – always shown when present
-            if citations:
+            # Citations – suppressed when a safety/security message is shown
+            if citations and not is_safety_response and "Security Alert" not in ai_answer:
                 render_citations(citations)
 
             # Feedback – shown for every normal response

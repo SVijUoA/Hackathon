@@ -67,8 +67,8 @@ MAX_CONVERSATION_TURNS = 10
 MAX_CONTEXT_CHUNKS = 3
 MAX_CONTEXT_CHUNK_CHARS = 700
 MAX_CONTEXT_TOTAL_CHARS = 2500
-MAX_FOUNDARY_OUTPUT_TOKENS = 2048
-MAX_FOUNDARY_RETRY_OUTPUT_TOKENS = 2048
+MAX_FOUNDARY_OUTPUT_TOKENS = 4096
+MAX_FOUNDARY_RETRY_OUTPUT_TOKENS = 4096
 
 
 def _debug_log(message: str):
@@ -825,43 +825,41 @@ def trim_context_chunks(retrieved_chunks: List[str], max_chunks: int = MAX_CONTE
 
 def condense_query(user_prompt: str, conversation_history: List[Dict[str, str]]) -> str:
     """
-    Rewrite a follow-up question into a fully self-contained search query by
-    incorporating relevant context from the conversation history.
+    Always synthesize a standalone search query from the current prompt plus
+    the single most recent Q&A pair from conversation history.
 
-    The condensed query is used for both vector-store retrieval and as the
-    standalone question sent to the LLM, replacing the raw multi-turn history.
-    Falls back to the original prompt if condensation fails or history is empty.
+    Sending every query through condensation (not just those with pronouns)
+    ensures consistent behaviour — the LLM decides whether context is relevant,
+    rather than a keyword heuristic. Falls back to the original prompt if
+    history is empty, foundry_client is unavailable, or the call fails.
     """
     if not conversation_history or not foundry_client:
         return user_prompt
 
-    # Collect the most recent Q+A pair (previous user question + assistant reply)
-    # that precedes the current prompt.  Including the assistant reply is critical
-    # because entity names (e.g. "Boostrix") often appear there, not in the user turn.
-    # The current prompt is already in session state, so skip it when searching.
+    # Collect the most recent Q&A pair that precedes the current prompt.
+    # The current prompt may already be in session state, so skip it.
     current_prompt_stripped = user_prompt.strip()
     prev_user_q = ""
     prev_assistant_a = ""
-
-    # Walk history in reverse; grab the first assistant turn, then the user
-    # turn before it (skipping the current prompt).
     found_assistant = False
+
     for message in reversed(conversation_history):
         role = message.get("role", "")
-        content = (message.get("content") or "").strip()
-        if not content:
+        msg_content = (message.get("content") or "").strip()
+        if not msg_content:
             continue
         if role == "assistant" and not found_assistant:
-            prev_assistant_a = content[:300]
+            prev_assistant_a = msg_content[:300]
             found_assistant = True
-        elif role == "user" and content != current_prompt_stripped:
-            prev_user_q = content[:200]
-            break  # we have both; stop
+        elif role == "user" and msg_content != current_prompt_stripped:
+            prev_user_q = msg_content[:200]
+            break
 
+    # Nothing useful in history — return prompt unchanged.
     if not prev_user_q and not prev_assistant_a:
         return user_prompt
 
-    context_lines = []
+    context_lines: List[str] = []
     if prev_user_q:
         context_lines.append(f"Previous question: {prev_user_q}")
     if prev_assistant_a:
@@ -870,32 +868,36 @@ def condense_query(user_prompt: str, conversation_history: List[Dict[str, str]])
 
     condensation_prompt = (
         f"{context_block}\n"
-        f"Follow-up: {user_prompt}\n"
-        "Rewrite the follow-up as a standalone search query resolving any pronouns or "
-        "vague references using the context above. "
+        f"Current question: {user_prompt}\n\n"
+        "Using the previous question and answer as context, rewrite the current question "
+        "as a fully standalone search query. Resolve all pronouns, vague references, and "
+        "implied subjects so the query makes sense without any prior context. "
+        "If the current question is already fully self-contained and unrelated to the previous "
+        "exchange, return it unchanged. "
         "Output only the rewritten query, nothing else."
     )
 
     try:
-        condensation_messages = [{"role": "user", "content": condensation_prompt}]
         response = foundry_client.chat_completions_create(
             model=foundry_chat_model,
-            messages=condensation_messages,
+            messages=[{"role": "user", "content": condensation_prompt}],
             max_tokens=500,
         )
         condensed = ""
         if isinstance(response, dict) and "choices" in response:
-            choice = response["choices"][0]
-            condensed = (choice.get("message") or {}).get("content", "").strip()
+            condensed = (
+                (response["choices"][0].get("message") or {})
+                .get("content", "")
+                .strip()
+            )
         if condensed:
             _debug_log(f"condense_query: '{user_prompt}' -> '{condensed}'")
             return condensed
     except Exception as exc:
         _debug_log(f"condense_query failed, using original prompt: {exc}")
 
+    _debug_log("condense_query: condensation returned empty, using original prompt")
     return user_prompt
-
-
 def generate_response(user_prompt, conversation_history=None):
     """
     Secure RAG backend function using Foundry for inference.
@@ -947,8 +949,14 @@ def generate_response(user_prompt, conversation_history=None):
     context = "\n\n".join(retrieved_chunks)
 
     prompt_text = (
-        "Answer using only the context below. Keep the answer concise and directly relevant. "
-        "If the answer cannot be found in the context, reply exactly: I couldn't find a clear answer in approved guidance.\n\n"
+        "Answer using ONLY the context provided below. "
+        "Provide a comprehensive, detailed answer covering all relevant information present in the context — "
+        "do not summarise or shorten unnecessarily. Use bullet points or structured sections where appropriate.\n"
+        "Do NOT use your own training knowledge, general knowledge, or any information outside the context.\n"
+        "If the question cannot be answered from the context, reply exactly: "
+        "I could not find information on this topic in the approved IMAC guidance documents.\n"
+        "If the question is out-of-domain (not related to immunisation, vaccines, or public health), reply exactly: "
+        "I could not find information on this topic in the approved IMAC guidance documents.\n\n"
         f"Context:\n{context}\n\n"
         f"Question:\n{standalone_query}"
     )
@@ -956,8 +964,16 @@ def generate_response(user_prompt, conversation_history=None):
     system_message = {
         "role": "system",
         "content": (
-            "You are an IMAC immunisation advisor. Use the earlier turns in the conversation to preserve context, "
-            "resolve follow-up references, and connect the current answer to prior discussion."
+            "You are an IMAC immunisation advisor. "
+            "You MUST answer exclusively from the context provided in the user message — "
+            "never from your own training data, general knowledge, or external sources. "
+            "Give thorough, complete answers that cover all relevant details from the context. "
+            "Do not truncate or over-summarise — include dosing schedules, eligibility, contraindications, "
+            "and any other relevant clinical detail present in the context. "
+            "If the context does not contain a relevant answer, or if the question is unrelated to "
+            "immunisation, vaccines, or public health, respond with exactly: "
+            "'I could not find information on this topic in the approved IMAC guidance documents.' "
+            "Do NOT answer political, general knowledge, or any out-of-domain questions under any circumstances."
         ),
     }
 
@@ -1122,11 +1138,13 @@ def generate_response(user_prompt, conversation_history=None):
         ai_answer = _extract_response_text(response)
         _debug_log(f"Extracted answer length: {len(ai_answer)} chars, preview: {ai_answer[:200] if ai_answer else '(empty)'}")
 
-        if "couldn't find a clear answer" in ai_answer.lower() and citations:
+        if "could not find information on this topic" in ai_answer.lower() and citations:
             _debug_log("Received refusal from strict prompt; retrying with summarization prompt.")
             summary_prompt = (
-                "Use the context to answer the question. If relevant guidance is present, summarize it directly. "
-                "Do not reply with a refusal.\n\n"
+                "Use ONLY the context below to answer the question. "
+                "If relevant guidance is present, summarize it directly. "
+                "Do NOT use your own knowledge or external sources. "
+                "Do not reply with a refusal if the context contains relevant information.\n\n"
                 f"Context:\n{context}\n\n"
                 f"Question:\n{standalone_query}"
             )
@@ -1134,12 +1152,14 @@ def generate_response(user_prompt, conversation_history=None):
             ai_answer = _extract_response_text(response)
             _debug_log(f"Retry answer length: {len(ai_answer)} chars, preview: {ai_answer[:200] if ai_answer else '(empty)'}")
 
-        # If the answer appears truncated (finish reason 'length' or ends without
-        # sentence terminator), attempt concise continuation requests to finish
-        # the sentence. This helps with mid-sentence cut-offs.
+        # Only attempt continuation if the response was genuinely cut off by
+        # the token limit (finish_reason='length'). When finish_reason='stop'
+        # the model considered the answer complete — attempting to continue it
+        # sends a fresh call without the original context, which causes the
+        # model to return a refusal that overwrites the good answer already extracted.
         try:
             finish_reason = _get_finish_reason(response)
-            if finish_reason == "length" or _looks_truncated(ai_answer):
+            if finish_reason == "length":
                 _debug_log(f"Detected truncated answer (finish_reason={finish_reason}); attempting continuation")
                 for attempt in range(2):
                     cont_prompt = "Please continue the previous answer and finish the sentence concisely."
@@ -1156,11 +1176,9 @@ def generate_response(user_prompt, conversation_history=None):
                         cont_text = ""
                     if cont_text:
                         _debug_log(f"Continuation #{attempt+1} appended, length={len(cont_text)}")
-                        # Append the continuation (ensure spacing)
                         if not ai_answer.endswith(" "):
                             ai_answer = ai_answer + " "
                         ai_answer = ai_answer + cont_text.strip()
-                        # If continuation seems to finish the sentence, break
                         if not _looks_truncated(ai_answer):
                             break
                 _debug_log(f"Post-continuation answer length: {len(ai_answer)}")

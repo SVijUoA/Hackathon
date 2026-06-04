@@ -309,27 +309,24 @@ def condense_query(
     conversation_history: Optional[List[Dict[str, str]]],
 ) -> str:
     """
-    Rewrite a follow-up question into a fully self-contained search query by
-    incorporating relevant context from the conversation history.
-
-    Uses a plain chat-completions call (not the IMAC agent) so the rephrasing
-    task is not blocked by clinical content filters or the agent's system prompt.
-    Falls back to the original prompt if history is empty or the call fails.
+    Always synthesize a standalone search query from the current prompt plus
+    the single most recent Q&A pair from conversation history.
+ 
+    Sending every query through condensation (not just those with pronouns)
+    ensures consistent behaviour — the LLM decides whether context is relevant,
+    rather than a keyword heuristic. Falls back to the original prompt if
+    history is empty or the condensation call fails.
     """
     if not conversation_history:
         return prompt
-
-    # Collect the most recent Q+A pair (previous user question + assistant reply)
-    # that precedes the current prompt.  Including the assistant reply is critical
-    # because entity names (e.g. "Boostrix") often appear there, not in the user turn.
-    # The current prompt is already in session state, so skip it when searching.
+ 
+    # Collect the most recent Q&A pair that precedes the current prompt.
+    # The current prompt may already be in session state, so skip it.
     current_prompt_stripped = prompt.strip()
     prev_user_q = ""
     prev_assistant_a = ""
-
-    # Walk history in reverse; grab the first assistant turn, then the user
-    # turn before it (skipping the current prompt).
     found_assistant = False
+ 
     for message in reversed(conversation_history):
         role = message.get("role", "")
         content = (message.get("content") or "").strip()
@@ -340,31 +337,35 @@ def condense_query(
             found_assistant = True
         elif role == "user" and content != current_prompt_stripped:
             prev_user_q = content[:200]
-            break  # we have both; stop
-
+            break
+ 
+    # Nothing useful in history — return prompt unchanged.
     if not prev_user_q and not prev_assistant_a:
         return prompt
-
+ 
     context_lines = []
     if prev_user_q:
         context_lines.append(f"Previous question: {prev_user_q}")
     if prev_assistant_a:
         context_lines.append(f"Previous answer (summary): {prev_assistant_a}")
     context_block = "\n".join(context_lines)
-
+ 
     condensation_prompt = (
         f"{context_block}\n"
-        f"Follow-up: {prompt}\n"
-        "Rewrite the follow-up as a standalone search query resolving any pronouns or "
-        "vague references using the context above. "
+        f"Current question: {prompt}\n\n"
+        "Using the previous question and answer as context, rewrite the current question "
+        "as a fully standalone search query. Resolve all pronouns, vague references, and "
+        "implied subjects so the query makes sense without any prior context. "
+        "If the current question is already fully self-contained and unrelated to the previous "
+        "exchange, return it unchanged. "
         "Output only the rewritten query, nothing else."
     )
-
+ 
     condensed = _chat_completions_for_condensation(condensation_prompt)
     if condensed:
         print(f"[DEBUG] condense_query: '{prompt}' -> '{condensed}'")
         return condensed
-
+ 
     print("[DEBUG] condense_query: condensation returned empty, using original prompt")
     return prompt
 
@@ -406,11 +407,16 @@ def ask_foundry_agent(
     # Instead, append a citation directive to the final user message so the
     # model is reminded to use FileSearch and cite sources on every turn.
     CITATION_SUFFIX = (
-        "\n\n[IMPORTANT: Search your indexed guidance documents before answering. "
-        "After each factual claim or bullet point, add the chapter and section in parentheses, "
-        "for example: (Chapter 4, Section 4.2) or (Appendix B). "
-        "Do not use numbered footnotes or superscripts — write the reference inline in the sentence. "
-        "At the end of your response list the source filenames you used.]"
+        "\n\n[STRICT INSTRUCTIONS — follow exactly:\n"
+        "1. After each factual claim, add the chapter and section in parentheses,, e.g. (Chapter 4, Section 4.2)."
+        "2. You MUST answer ONLY using information found in your indexed guidance documents via the file search tool. "
+        "Do NOT use your own training knowledge, general medical knowledge, or any web sources.\n"
+        "3. If the file search tool returns no relevant results, respond with exactly: "
+        "'I could not find information on this topic in the approved IMAC guidance documents.' "
+        "Do not attempt to answer from memory or suggest the user look elsewhere.\n"
+        "4. Do NOT offer to search the web, do NOT suggest external sources, and do NOT answer political, "
+        "general knowledge, or out-of-domain questions under any circumstances.\n" \
+        "5. Do NOT list Sources used at the end.]"
     )
     if prepared_messages and prepared_messages[-1].get("role") == "user":
         last = prepared_messages[-1]
